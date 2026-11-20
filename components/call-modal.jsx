@@ -1,154 +1,90 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
-
 /**
- * Mode "Call": simulasi telepon dengan AI.
- * - STT: user bicara (Web Speech API)
- * - TTS: AI menjawab (Web Speech API)
- * - Loop: setelah TTS selesai, otomatis STT dimulai lagi (hands-free)
+ * Mode "Call": tampilan panggilan (presentational).
+ * Seluruh loop (greeting → TTS → STT → kirim → TTS) dikendalikan parent.
  */
 export default function CallModal({
-  onClose,
-  settings,
-  sendMessage,
-  speak,
-  cancelSpeech,
-  startSTT,
-  stopSTT,
-  listening,
-  ttsSupported,
-  sttSupported,
+  phase = "connecting",
+  seconds = 0,
+  lastText = "",
+  interim = "",
+  listening = false,
+  sttSupported = true,
+  onToggleMic,
+  onEnd,
 }) {
-  const [phase, setPhase] = useState("connecting"); // connecting | talking | listening | ended
-  const [callSeconds, setCallSeconds] = useState(0);
-  const [lastText, setLastText] = useState("");
-  const timerRef = useRef(null);
-  const phaseRef = useRef(phase);
-  const speakingRef = useRef(false);
-
-  useEffect(() => {
-    phaseRef.current = phase;
-  }, [phase]);
-
-  // Timer durasi
-  useEffect(() => {
-    if (phase === "ended") return;
-    timerRef.current = setInterval(() => {
-      setCallSeconds((s) => s + 1);
-    }, 1000);
-    return () => clearInterval(timerRef.current);
-  }, [phase === "ended"]);
-
-  // Greeting saat masuk
-  const startedRef = useRef(false);
-  const startCall = useCallback(async () => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-
-    if (!settings.apiKey) {
-      setLastText("⚠️ API key belum diisi. Isi di panel kiri lalu panggil lagi.");
-      setPhase("ended");
-      return;
-    }
-
-    // Kirim greeting dari AI
-    try {
-      await sendMessage("Halo! Mulai mode call.");
-      setPhase("talking");
-      // TTS greeting manual (jangan andalkan autoSpeak karena mode call selalu bicara)
-      speak("Halo, saya siap membantu. Apa yang ingin kamu bicarakan?", {
-        voiceURI: settings.voiceURI,
-        rate: settings.speechRate,
-        onEnd: () => {
-          if (sttSupported) {
-            setPhase("listening");
-            startSTT();
-          }
-        },
-      });
-    } catch (err) {
-      setLastText(`Gagal mulai: ${err.message}`);
-      setPhase("ended");
-    }
-  }, [
-    settings,
-    sendMessage,
-    speak,
-    ttsSupported,
-    sttSupported,
-    startSTT,
-  ]);
-
-  useEffect(() => {
-    if (phase === "connecting") startCall();
-  }, [phase, startCall]);
-
-  // Jika STT aktif dan phase listening, dengarkan. Tapi startSTT/stopSTT
-  // berasal dari hook di parent — di sini kita hanya menampilkan state.
-
-  const endCall = () => {
-    stopSTT();
-    cancelSpeech();
-    setPhase("ended");
-  };
-
   const statusText =
     phase === "connecting"
       ? "Menyambung…"
       : phase === "talking"
-      ? "AI sedang bicara…"
-      : phase === "listening"
-      ? "Mendengarkan…"
-      : "Selesai";
+        ? "AI sedang bicara…"
+        : phase === "listening"
+          ? "Mendengarkan…"
+          : "Selesai";
 
-  const mm = String(Math.floor(callSeconds / 60)).padStart(2, "0");
-  const ss = String(callSeconds % 60).padStart(2, "0");
+  const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
+  const ss = String(seconds % 60).padStart(2, "0");
+  const caption = interim || lastText;
 
   return (
-    <div className="call-overlay" onClick={(e) => e.target === e.currentTarget && endCall()}>
-      <div className="call-card">
+    <div
+      className="call-overlay"
+      onClick={(e) => e.target === e.currentTarget && onEnd?.()}
+    >
+      <div className="call-card" role="dialog" aria-label="Mode panggilan">
         <div className={`call-avatar ${phase === "connecting" ? "ringing" : ""}`}>
-          AI
+          <i className="bi bi-water" aria-hidden="true" />
         </div>
-        <div className="call-title">BYOK Call</div>
+
+        <div className="call-title">Sharkie Call</div>
+
         <div className="call-status">
           {statusText} · {mm}:{ss}
         </div>
 
-        <div className={`call-wave ${phase === "talking" ? "speaking" : ""}`}>
+        <div
+          className={`call-wave ${phase === "talking" || listening ? "speaking" : ""}`}
+          aria-hidden="true"
+        >
           <span /> <span /> <span /> <span /> <span />
         </div>
 
-        {lastText && (
-          <div
-            style={{
-              fontSize: 12,
-              color: "var(--muted)",
-              maxWidth: "100%",
-              overflowWrap: "break-word",
-            }}
-          >
-            {lastText}
+        {caption && (
+          <div className="call-caption" aria-live="polite">
+            {caption}
           </div>
         )}
 
         <div className="call-controls">
           <button
-            title={listening ? "Berhenti dengar" : "Bicara (STT)"}
-            onClick={() => (listening ? stopSTT() : startSTT())}
+            type="button"
+            className={listening ? "mic-on" : ""}
+            title={listening ? "Berhenti dengar" : "Bicara"}
+            aria-label={listening ? "Berhenti dengar" : "Bicara"}
+            onClick={() => onToggleMic?.()}
             disabled={!sttSupported}
           >
-            {listening ? "⏹" : "🎙"}
+            {listening ? (
+              <i className="bi bi-stop-fill" aria-hidden="true" />
+            ) : (
+              <i className="bi bi-mic-fill" aria-hidden="true" />
+            )}
           </button>
-          <button className="end" title="Akhirkan call" onClick={endCall}>
-            ✕
+          <button
+            type="button"
+            className="end"
+            title="Akhirkan panggilan"
+            aria-label="Akhirkan panggilan"
+            onClick={() => onEnd?.()}
+          >
+            <i className="bi bi-telephone-x-fill" aria-hidden="true" />
           </button>
         </div>
 
         {!sttSupported && (
-          <div style={{ fontSize: 11, color: "var(--danger)" }}>
-            Browser ini tidak mendukung Speech Recognition. Gunakan Chrome/Edge/Safari.
+          <div className="call-warn">
+            Browser ini tidak mendukung mic. Gunakan Chrome, Edge, atau Safari.
           </div>
         )}
       </div>

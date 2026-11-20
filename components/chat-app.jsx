@@ -15,6 +15,10 @@ import {
   usePersistence,
 } from "@/lib/persistence";
 import CallModal from "./call-modal";
+import IosSelect from "./ios-select";
+import ModelCombobox from "./model-combobox";
+import { TTS_LANGS, STT_LANGS } from "@/lib/speech-langs";
+import { prefetchWhisper } from "@/lib/whisper-client";
 
 const PROVIDERS = [
   { id: "openai", label: "OpenAI" },
@@ -39,7 +43,8 @@ const DEFAULT_SETTINGS = {
   model: DEFAULT_MODELS.openai,
   voiceURI: "",
   speechRate: 1,
-  lang: "id-ID",
+  ttsLang: "id",
+  sttLang: "id-ID",
   autoSpeak: false,
   systemPrompt: "Kamu asisten yang membantu, jawaban singkat dan jelas.",
 };
@@ -49,6 +54,8 @@ export function ChatApp() {
   const [conversations, setConversations] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [input, setInput] = useState("");
+  const [interim, setInterim] = useState("");
+  const [showKey, setShowKey] = useState(false);
   const [attachedImages, setAttachedImages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
@@ -67,6 +74,19 @@ export function ChatApp() {
   const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
   const abortRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  // ── Mode panggilan (loop dikendalikan di sini) ──
+  const [callPhase, setCallPhase] = useState("connecting");
+  const [callSeconds, setCallSeconds] = useState(0);
+  const [callLastText, setCallLastText] = useState("");
+  const callModeRef = useRef(false);
+  const callTranscriptRef = useRef("");
+  const sendRef = useRef(null);
+  const speakRef = useRef(null);
+  const startSTTRef = useRef(null);
+  const stopSTTRef = useRef(null);
+  const callTurnRef = useRef(null);
 
   // Muat settings + konversasi dari IndexedDB setelah mount
   useEffect(() => {
@@ -77,8 +97,22 @@ export function ChatApp() {
       ]);
       setSettings(loadedSettings);
       setConversations(loadedConvs);
+      // Daftar model di-cache agar tetap ada setelah refresh
+      let cached = [];
+      try {
+        cached = JSON.parse(localStorage.getItem("sharkie-models") || "[]");
+      } catch {
+        cached = [];
+      }
+      if (Array.isArray(cached) && cached.length) setModelList(cached);
       setLoaded(true);
     })();
+
+    // Kunjungan pertama: unduh model Whisper di background (idle) agar
+    // transkripsi offline siap saat dibutuhkan. Diam saja bila gagal.
+    const idle =
+      window.requestIdleCallback || ((fn) => setTimeout(fn, 4000));
+    idle(() => prefetchWhisper());
   }, []);
 
   // Persist ke IndexedDB
@@ -90,14 +124,28 @@ export function ChatApp() {
     start: startSTT,
     stop: stopSTT,
   } = useSpeechRecognition({
-    lang: settings.lang,
+    lang: settings.sttLang,
     continuous: false,
-    onResult: ({ transcript }) => {
-      setInput((prev) => (prev ? prev + " " : "") + transcript.trim());
+    onResult: ({ final, interim: partial }) => {
+      if (final) {
+        callTranscriptRef.current = (callTranscriptRef.current + " " + final).trim();
+        if (!callModeRef.current) {
+          setInput((prev) => (prev ? prev + " " : "") + final.trim());
+        }
+      }
+      setInterim(partial || "");
     },
     onEnd: ({ error: micError } = {}) => {
+      setInterim("");
       if (micError) setError(micError);
       else setError(null);
+
+      // Selesai bicara di mode panggilan → kirim transkrip ke AI
+      if (callModeRef.current && callTranscriptRef.current.trim()) {
+        const said = callTranscriptRef.current.trim();
+        callTranscriptRef.current = "";
+        callTurnRef.current?.(said);
+      }
     },
   });
 
@@ -117,7 +165,16 @@ export function ChatApp() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length, streaming]);
 
-  const updateSettings = (patch) =>
+  const updateSettings = (patch) => {
+    // Ganti provider: reset model ke default & buang cache daftar model lama
+    if (patch.provider) {
+      setModelList([]);
+      try {
+        localStorage.removeItem("sharkie-models");
+      } catch {
+        /* ignore */
+      }
+    }
     setSettings((s) => {
       const next = { ...s, ...patch };
       if (patch.provider && !patch.model) {
@@ -125,6 +182,7 @@ export function ChatApp() {
       }
       return next;
     });
+  };
 
   const newConversation = useCallback(() => {
     stopSTT();
@@ -149,6 +207,12 @@ export function ChatApp() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Gagal ambil model");
       setModelList(data.models);
+      // Cache lintas-refresh supaya dropdown tidak kosong setelah reload
+      try {
+        localStorage.setItem("sharkie-models", JSON.stringify(data.models));
+      } catch {
+        /* storage penuh / private mode */
+      }
     } catch (e) {
       setError(e.message);
     } finally {
@@ -171,12 +235,22 @@ export function ChatApp() {
       ? [...conv.messages, newUserMsg]
       : [newUserMsg];
     return msgs
-      .filter((m) => m.role !== "error")
-      .map((m) => ({
-        role: m.role,
-        content: m.content,
-        ...(m.images?.length ? { images: m.images } : {}),
-      }));
+      .filter((m) => m.role !== "error" && (m.content?.trim() || m.images?.length))
+      .map((m) => {
+        if (!m.images?.length) {
+          return { role: m.role, content: m.content };
+        }
+        return {
+          role: m.role,
+          content: [
+            ...(m.content?.trim() ? [{ type: "text", text: m.content }] : []),
+            ...m.images.map((src) => ({
+              type: "image_url",
+              image_url: { url: src },
+            })),
+          ],
+        };
+      });
   };
 
   // Streaming SSE: kirim pesan, update placeholder asisten per chunk
@@ -310,6 +384,7 @@ export function ChatApp() {
 
       setInput("");
       setAttachedImages([]);
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
       setLoading(true);
 
       const baseConv = isNew
@@ -320,21 +395,14 @@ export function ChatApp() {
         ...getHistoryBase(baseConv, newUserMsg),
       ];
 
-      if (images.length) {
-        const lastUser = apiMessages[apiMessages.length - 1];
-        lastUser.content = [
-          ...(content ? [{ type: "text", text: content }] : []),
-          ...images.map((src) => ({
-            type: "image_url",
-            image_url: { url: src },
-          })),
-        ];
-      }
-
       try {
         const reply = await streamSend(conversationId, apiMessages);
         if (settings.autoSpeak && reply) {
-          speak(reply, { voiceURI: settings.voiceURI, rate: settings.speechRate });
+          speak(reply, {
+            voiceURI: settings.voiceURI,
+            rate: settings.speechRate,
+            lang: settings.ttsLang,
+          });
         }
         return reply;
       } catch (err) {
@@ -366,7 +434,122 @@ export function ChatApp() {
 
   const stopStreaming = () => abortRef.current?.abort();
 
+  // ── Loop mode panggilan ──
+  // greeting → TTS selesai → STT → transkrip final → kirim → TTS → STT …
+  const callSay = useCallback(
+    (text, onDone) => {
+      if (!text) {
+        onDone?.();
+        return;
+      }
+      speakRef.current?.(text, {
+        voiceURI: settings.voiceURI,
+        rate: settings.speechRate,
+        lang: settings.ttsLang,
+        onEnd: () => {
+          if (!callModeRef.current) return;
+          onDone?.();
+        },
+      });
+    },
+    [settings.voiceURI, settings.speechRate, settings.ttsLang]
+  );
+
+  const callListen = useCallback(() => {
+    if (!callModeRef.current) return;
+    callTranscriptRef.current = "";
+    setCallPhase("listening");
+    startSTTRef.current?.();
+  }, []);
+
+  const callTurn = useCallback(
+    async (userText) => {
+      if (!callModeRef.current || !userText?.trim()) {
+        callListen();
+        return;
+      }
+      setCallPhase("talking");
+      setCallLastText("");
+      const reply = await sendRef.current?.(userText, []);
+      if (!callModeRef.current) return;
+      if (reply) {
+        setCallLastText(reply);
+        callSay(reply, callListen);
+      } else {
+        callListen();
+      }
+    },
+    [callSay, callListen]
+  );
+
+  const endCall = useCallback(() => {
+    callModeRef.current = false;
+    stopSTTRef.current?.();
+    cancelSpeech();
+    setCallOpen(false);
+    setCallPhase("connecting");
+    setCallSeconds(0);
+    setCallLastText("");
+    setInterim("");
+  }, [cancelSpeech]);
+
+  const startCall = useCallback(() => {
+    if (!settings.apiKey) {
+      setError("Isi API key dulu sebelum memulai panggilan.");
+      return;
+    }
+    callModeRef.current = true;
+    setCallSeconds(0);
+    setCallLastText("");
+    setCallPhase("connecting");
+    setCallOpen(true);
+
+    const greeting = "Halo! Saya Sharkie. Ada yang bisa saya bantu?";
+    setCallLastText(greeting);
+    setTimeout(() => {
+      if (!callModeRef.current) return;
+      callSay(greeting, callListen);
+    }, 350);
+  }, [settings.apiKey, callSay, callListen]);
+
+  // Timer durasi panggilan
+  useEffect(() => {
+    if (!callOpen) return;
+    const t = setInterval(() => setCallSeconds((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [callOpen]);
+
+  const toggleCallMic = () => {
+    if (listening) stopSTT();
+    else {
+      callTranscriptRef.current = "";
+      startSTT();
+    }
+  };
+
+  // Sinkronkan ref agar loop panggilan selalu memakai versi terbaru
+  useEffect(() => {
+    sendRef.current = send;
+    speakRef.current = speak;
+    startSTTRef.current = startSTT;
+    stopSTTRef.current = stopSTT;
+    callTurnRef.current = callTurn;
+  });
+
   const submit = () => send(input, attachedImages);
+
+  // Auto-resize textarea mengikuti isi (maks 140px)
+  const resizeTextarea = () => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 140) + "px";
+  };
+
+  const onInputChange = (e) => {
+    setInput(e.target.value);
+    resizeTextarea();
+  };
 
   const onKey = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -397,7 +580,12 @@ export function ChatApp() {
 
   const speakLast = () => {
     const last = [...messages].reverse().find((m) => m.role === "assistant");
-    if (last) speak(last.content, { voiceURI: settings.voiceURI, rate: settings.speechRate });
+    if (last)
+      speak(last.content, {
+        voiceURI: settings.voiceURI,
+        rate: settings.speechRate,
+        lang: settings.ttsLang,
+      });
   };
 
   // Riwayat: group per tanggal
@@ -453,7 +641,7 @@ export function ChatApp() {
     streaming && messages.length > 0 && messages[messages.length - 1].role === "assistant";
 
   return (
-    <>
+    <div className="app">
       <header className="header">
         <button
           className="btn menu-toggle"
@@ -461,12 +649,12 @@ export function ChatApp() {
           aria-label="Buka sidebar"
           onClick={() => setSidebarOpen(true)}
         >
-          ☰
+          <i className="bi bi-list" aria-hidden="true" />
         </button>
-        <h1>BYOK Chat AI</h1>
+        <h1>Sharkie AI Chat-Call</h1>
         <div className="actions">
-          <button className="btn primary" onClick={() => setCallOpen(true)}>
-            📞 Call
+          <button className="btn primary" onClick={startCall}>
+            <i className="bi bi-telephone-fill" aria-hidden="true" /> Call
           </button>
           <button className="btn" onClick={newConversation}>
             + New
@@ -487,26 +675,43 @@ export function ChatApp() {
 
           <div className="field">
             <label>Provider</label>
-            <select
+            <IosSelect
               value={settings.provider}
-              onChange={(e) => updateSettings({ provider: e.target.value })}
-            >
-              {PROVIDERS.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
+              onChange={(v) => updateSettings({ provider: v })}
+              options={PROVIDERS.map((p) => ({ value: p.id, label: p.label }))}
+              ariaLabel="Pilih provider"
+            />
           </div>
 
           <div className="field">
-            <label>API Key</label>
-            <input
-              type="password"
-              value={settings.apiKey}
-              placeholder="sk-..."
-              onChange={(e) => updateSettings({ apiKey: e.target.value })}
-            />
+            <label htmlFor="api-key-input">API Key</label>
+            <form
+              className="api-key-form"
+              onSubmit={(e) => e.preventDefault()}
+              autoComplete="on"
+            >
+              <div className="api-key-wrap">
+                <input
+                  id="api-key-input"
+                  type={showKey ? "text" : "password"}
+                  value={settings.apiKey}
+                  placeholder="sk-..."
+                  autoComplete="off"
+                  onChange={(e) => updateSettings({ apiKey: e.target.value })}
+                />
+                <button
+                  type="button"
+                  className="icon-btn key-toggle"
+                  aria-label={showKey ? "Sembunyikan API key" : "Tampilkan API key"}
+                  onClick={() => setShowKey((v) => !v)}
+                >
+                  <i
+                    className={showKey ? "bi bi-eye-slash" : "bi bi-eye"}
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+            </form>
             <div className="hint">
               Key disimpan hanya di browser (IndexedDB). Tidak dikirim ke
               server mana pun kecuali ke provider AI pilihanmu.
@@ -527,54 +732,99 @@ export function ChatApp() {
 
           <div className="field">
             <label>Model</label>
-            <input
-              type="text"
-              list="model-options"
+            <ModelCombobox
               value={settings.model}
-              placeholder="gpt-4o-mini"
-              onChange={(e) => updateSettings({ model: e.target.value })}
+              onChange={(v) => updateSettings({ model: v })}
+              options={modelList}
             />
-            <datalist id="model-options">
-              {modelList.map((m) => (
-                <option key={m} value={m} />
-              ))}
-            </datalist>
             <button
               className="btn small"
               disabled={modelLoading || !settings.apiKey}
               onClick={fetchModels}
             >
-              {modelLoading ? "Memuat…" : "🔄 Fetch Models"}
+              {modelLoading ? (
+                "Memuat…"
+              ) : (
+                <>
+                  <i className="bi bi-arrow-repeat" aria-hidden="true" /> Fetch
+                  Models
+                </>
+              )}
             </button>
           </div>
 
-          <div className="section-title">Voice</div>
+          <div className="section-title">Suara & Bahasa</div>
 
           <div className="field">
-            <label>
+            <label className="switch-row">
+              <span>Auto-speak balasan</span>
               <input
                 type="checkbox"
+                className="switch"
                 checked={settings.autoSpeak}
                 onChange={(e) => updateSettings({ autoSpeak: e.target.checked })}
               />
-              Auto-speak balasan
             </label>
           </div>
 
-          {settings.autoSpeak && (
+          <div className="field">
+            <label>Bahasa suara AI (TTS)</label>
+            <IosSelect
+              value={settings.ttsLang}
+              onChange={(v) => updateSettings({ ttsLang: v })}
+              options={TTS_LANGS.map((l) => ({ value: l.code, label: l.label }))}
+              ariaLabel="Bahasa suara AI"
+            />
+            <div className="hint">Suara Google, jalan di semua browser.</div>
+          </div>
+
+          <div className="field">
+            <label>Bahasa input mic (STT)</label>
+            <IosSelect
+              value={settings.sttLang}
+              onChange={(v) => updateSettings({ sttLang: v })}
+              options={STT_LANGS.map((l) => ({ value: l.code, label: l.label }))}
+              ariaLabel="Bahasa input mic"
+            />
+          </div>
+
+          <div className="field">
+            <label>
+              Kecepatan bicara — {settings.speechRate.toFixed(1)}x
+            </label>
+            <input
+              type="range"
+              min="0.5"
+              max="2"
+              step="0.1"
+              value={settings.speechRate}
+              style={{
+                "--p": `${((settings.speechRate - 0.5) / 1.5) * 100}%`,
+              }}
+              onChange={(e) =>
+                updateSettings({ speechRate: Number(e.target.value) })
+              }
+            />
+          </div>
+
+          {settings.autoSpeak && voices.length > 0 && (
             <div className="field">
-              <label>Voice</label>
-              <select
+              <label>Voice fallback (offline)</label>
+              <IosSelect
                 value={settings.voiceURI}
-                onChange={(e) => updateSettings({ voiceURI: e.target.value })}
-              >
-                <option value="">(default)</option>
-                {voices.map((v) => (
-                  <option key={v.voiceURI} value={v.voiceURI}>
-                    {v.name} ({v.lang})
-                  </option>
-                ))}
-              </select>
+                onChange={(v) => updateSettings({ voiceURI: v })}
+                options={[
+                  { value: "", label: "(default)" },
+                  ...voices.map((v) => ({
+                    value: v.voiceURI,
+                    label: `${v.name} (${v.lang})`,
+                  })),
+                ]}
+                ariaLabel="Voice fallback"
+              />
+              <div className="hint">
+                Dipakai hanya bila Google TTS gagal.
+              </div>
             </div>
           )}
 
@@ -596,7 +846,10 @@ export function ChatApp() {
               <div key={c.id} className="conv-row">
                 <button
                   className={`item ${c.id === activeId ? "active" : ""}`}
-                  onClick={() => setActiveId(c.id)}
+                  onClick={() => {
+                    setActiveId(c.id);
+                    setSidebarOpen(false);
+                  }}
                 >
                   {c.title}
                 </button>
@@ -605,7 +858,7 @@ export function ChatApp() {
                   title="Hapus percakapan"
                   onClick={() => removeConversation(c.id)}
                 >
-                  🗑
+                  <i className="bi bi-trash3" aria-hidden="true" />
                 </button>
               </div>
             ))}
@@ -614,7 +867,11 @@ export function ChatApp() {
           {/* ── Riwayat ── */}
           <div className="section-title">
             <button className="btn small link" onClick={() => setHistoryOpen(!historyOpen)}>
-              📂 Riwayat {historyOpen ? "▲" : "▼"}
+              <i className="bi bi-clock-history" aria-hidden="true" /> Riwayat{" "}
+              <i
+                className={`bi bi-chevron-${historyOpen ? "up" : "down"}`}
+                aria-hidden="true"
+              />
             </button>
           </div>
           {historyOpen && (
@@ -629,7 +886,7 @@ export function ChatApp() {
                       title={`Hapus semua pada ${dateKey}`}
                       onClick={() => handleDeleteByDate(dateKey)}
                     >
-                      🗑
+                      <i className="bi bi-trash3" aria-hidden="true" />
                     </button>
                   </div>
                   {convs.map((c) => (
@@ -638,14 +895,14 @@ export function ChatApp() {
                       className="item history-item"
                       onClick={() => openConversationFromHistory(c.id)}
                     >
-                      ↩️ {c.title}
+                      <i className="bi bi-box-arrow-in-right" aria-hidden="true" /> {c.title}
                     </button>
                   ))}
                 </div>
               ))}
               {Object.keys(groupedHistory).length > 0 && (
                 <button className="btn danger small" onClick={handleDeleteAll}>
-                  🗑 Hapus Semua
+                  <i className="bi bi-trash3" aria-hidden="true" /> Hapus Semua
                 </button>
               )}
             </div>
@@ -655,13 +912,13 @@ export function ChatApp() {
           <div className="section-title">Umpan Balik</div>
           <div className="feedback-buttons">
             <button className="btn small" onClick={() => setFeedbackOpen(true)}>
-              💬 Beri Umpan Balik
+              <i className="bi bi-chat-dots" aria-hidden="true" /> Beri Umpan Balik
             </button>
             <button className="btn small" onClick={() => setRateOpen(true)}>
-              ⭐ Rate App
+              <i className="bi bi-star" aria-hidden="true" /> Rate App
             </button>
             <button className="btn small" onClick={() => setSupportOpen(true)}>
-              🛟 Dukungan
+              <i className="bi bi-life-preserver" aria-hidden="true" /> Dukungan
             </button>
           </div>
         </aside>
@@ -670,10 +927,12 @@ export function ChatApp() {
           <div className="messages">
             {messages.length === 0 ? (
               <div className="empty-state">
-                <div className="big">💬</div>
-                <div>Mulai percakapan atau tekan tombol 📞 Call.</div>
+                <div className="big">
+                  <i className="bi bi-chat-dots-fill" aria-hidden="true" />
+                </div>
+                <div>Mulai percakapan atau tekan tombol Call.</div>
                 <div className="hint">
-                  Pastikan API key sudah diisi di panel kiri.
+                  Isi API key di panel pengaturan dulu.
                 </div>
               </div>
             ) : (
@@ -682,7 +941,7 @@ export function ChatApp() {
                   key={i}
                   className={`message ${
                     m.role === "user" ? "user" : m.role === "error" ? "error" : "assistant"
-                  }`}
+                  }${messages[i + 1]?.role === m.role && m.role !== "error" ? " grouped" : ""}`}
                 >
                   {m.images?.length > 0 && (
                     <div>
@@ -694,13 +953,27 @@ export function ChatApp() {
                   {m.content}
                   {i === messages.length - 1 &&
                     isStreamingLastAssistant &&
-                    <span className="stream-cursor">▍</span>}
+                    <span className="stream-cursor" />}
                 </div>
               ))
             )}
             {loading && <div className="typing">AI sedang mengetik…</div>}
             <div ref={messagesEndRef} />
           </div>
+
+          {error && (
+            <div className="error-banner" role="alert">
+              <i className="bi bi-exclamation-triangle-fill" aria-hidden="true" />
+              <span>{error}</span>
+              <button
+                className="icon-btn"
+                aria-label="Tutup pesan galat"
+                onClick={() => setError(null)}
+              >
+                <i className="bi bi-x-lg" aria-hidden="true" />
+              </button>
+            </div>
+          )}
 
           {attachedImages.length > 0 && (
             <div className="attached-images">
@@ -715,13 +988,24 @@ export function ChatApp() {
             </div>
           )}
 
+          {listening && (
+            <div className="listening-bar" role="status" aria-live="polite">
+              <span className="dot-wave">
+                <span /> <span /> <span />
+              </span>
+              <span className="listening-text">
+                {interim ? interim : "Mendengarkan…"}
+              </span>
+            </div>
+          )}
+
           <div className="composer">
             <button
               className="icon-btn"
               title="Lampirkan gambar (vision)"
               onClick={() => fileInputRef.current?.click()}
             >
-              🖼
+              <i className="bi bi-image" aria-hidden="true" />
             </button>
             <input
               ref={fileInputRef}
@@ -732,19 +1016,33 @@ export function ChatApp() {
               onChange={onFile}
             />
             <textarea
+              ref={textareaRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={onInputChange}
               onKeyDown={onKey}
-              placeholder={sttSupported ? "Ketik atau tekan mic untuk bicara…" : "Ketik pesan…"}
+              placeholder={
+              listening
+                ? "Mendengarkan… bicara sekarang"
+                : sttSupported
+                  ? "Ketik atau tekan mic untuk bicara…"
+                  : "Ketik pesan…"
+            }
               rows={1}
             />
             {sttSupported && (
               <button
-                className={`icon-btn ${listening ? "active" : ""}`}
+                className={`icon-btn ${listening ? "active listening" : ""}`}
                 title={listening ? "Berhenti dengar" : "Bicara (STT)"}
+                aria-label={listening ? "Berhenti dengar" : "Bicara"}
                 onClick={toggleSTT}
               >
-                {listening ? "⏹" : "🎙"}
+                {listening ? (
+                  <span className="mic-pulse">
+                    <i className="bi bi-stop-fill" aria-hidden="true" />
+                  </span>
+                ) : (
+                  <i className="bi bi-mic-fill" aria-hidden="true" />
+                )}
               </button>
             )}
             {ttsSupported && (
@@ -753,12 +1051,12 @@ export function ChatApp() {
                 title="Baca balasan terakhir (TTS)"
                 onClick={speakLast}
               >
-                🔊
+                <i className="bi bi-volume-up-fill" aria-hidden="true" />
               </button>
             )}
             {streaming ? (
               <button className="btn danger" onClick={stopStreaming}>
-                ⏹ Stop
+                <i className="bi bi-stop-fill" aria-hidden="true" /> Stop
               </button>
             ) : (
               <button
@@ -766,7 +1064,11 @@ export function ChatApp() {
                 disabled={loading}
                 onClick={submit}
               >
-                {loading ? "…" : "Kirim"}
+                {loading ? (
+                  <span className="spinner" aria-label="Mengirim" />
+                ) : (
+                  <i className="bi bi-arrow-up" aria-label="Kirim" />
+                )}
               </button>
             )}
           </div>
@@ -775,10 +1077,14 @@ export function ChatApp() {
 
       {callOpen && (
         <CallModal
-          settings={settings}
-          onClose={() => setCallOpen(false)}
-          onSend={send}
-          speak={speak}
+          phase={callPhase}
+          seconds={callSeconds}
+          lastText={callLastText}
+          interim={interim}
+          listening={listening}
+          sttSupported={sttSupported}
+          onToggleMic={toggleCallMic}
+          onEnd={endCall}
         />
       )}
 
@@ -786,7 +1092,10 @@ export function ChatApp() {
       {feedbackOpen && (
         <div className="modal-overlay" onClick={() => setFeedbackOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>💬 Beri Umpan Balik</h3>
+            <h3>
+              <i className="bi bi-chat-dots" aria-hidden="true" /> Beri Umpan
+              Balik
+            </h3>
             <textarea
               value={feedback.text}
               onChange={(e) => setFeedback({ ...feedback, text: e.target.value })}
@@ -831,16 +1140,19 @@ export function ChatApp() {
       {rateOpen && (
         <div className="modal-overlay" onClick={() => setRateOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>⭐ Rate App</h3>
-            <p>Seberapa puas Anda dengan BYOK Chat AI?</p>
+            <h3>
+              <i className="bi bi-star" aria-hidden="true" /> Rate App
+            </h3>
+            <p>Seberapa puas Anda dengan Sharkie AI Chat-Call?</p>
             <div className="rating-input large">
               {[1, 2, 3, 4, 5].map((n) => (
                 <button
                   key={n}
                   className={`star large ${rating >= n ? "active" : ""}`}
+                  aria-label={`Beri ${n} bintang`}
                   onClick={() => setRating(n)}
                 >
-                  ★
+                  <i className="bi bi-star-fill" aria-hidden="true" />
                 </button>
               ))}
             </div>
@@ -861,11 +1173,15 @@ export function ChatApp() {
       {supportOpen && (
         <div className="modal-overlay" onClick={() => setSupportOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>🛟 Dukungan</h3>
+            <h3>
+              <i className="bi bi-life-preserver" aria-hidden="true" /> Dukungan
+            </h3>
             <p>Ada masalah atau pertanyaan? Hubungi kami:</p>
             <ul className="support-links">
               <li>
-                <a href="mailto:support@byokchat.example">📧 support@byokchat.example</a>
+                <a href="mailto:support@byokchat.example">
+                  <i className="bi bi-envelope" aria-hidden="true" /> support@byokchat.example
+                </a>
               </li>
               <li>
                 <a
@@ -873,7 +1189,7 @@ export function ChatApp() {
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  🐛 Laporan Bug (GitHub)
+                  <i className="bi bi-bug" aria-hidden="true" /> Laporan Bug (GitHub)
                 </a>
               </li>
               <li>
@@ -882,7 +1198,7 @@ export function ChatApp() {
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  📖 Dokumentasi / FAQ
+                  <i className="bi bi-book" aria-hidden="true" /> Dokumentasi / FAQ
                 </a>
               </li>
             </ul>
@@ -894,7 +1210,7 @@ export function ChatApp() {
           </div>
         </div>
       )}
-    </>
+    </div>
   );
 }
 
